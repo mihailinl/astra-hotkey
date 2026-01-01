@@ -1,4 +1,4 @@
-StellaHotkey Source Available License
+AstraHotkey Source Available License
 
 Copyright (c) 2025 Mihailin. All rights reserved.
 
@@ -6,10 +6,10 @@ TERMS AND CONDITIONS
 
 1. DEFINITIONS
 
-"Software" means the StellaHotkey global hotkey service source code and
+"Software" means the AstraHotkey global hotkey service source code and
 associated documentation files.
 
-"Stella" means the Stella AI assistant application developed by the copyright
+"Astra" means the Astra AI assistant application developed by the copyright
 holder.
 
 "You" means the individual or entity exercising rights under this License.
@@ -24,8 +24,8 @@ a) VIEW AND AUDIT: You may view, read, and audit the source code solely for
    designed to only process registered hotkey combinations and does NOT
    capture, store, log, or transmit any keyboard input to external services.
 
-b) PERSONAL USE WITH STELLA: You may compile and use the Software solely in
-   conjunction with Stella for your own personal, non-commercial purposes.
+b) PERSONAL USE WITH ASTRA: You may compile and use the Software solely in
+   conjunction with Astra for your own personal, non-commercial purposes.
 
 c) BUG REPORTS: You may submit bug reports and security vulnerability
    disclosures to the copyright holder.
@@ -37,7 +37,7 @@ You may NOT:
 a) Use the Software for any commercial purpose or in any commercial product
    or service.
 
-b) Use the Software independently of Stella or integrate it with any other
+b) Use the Software independently of Astra or integrate it with any other
    application, product, or service.
 
 c) Modify, adapt, translate, or create derivative works based on the Software.
@@ -45,7 +45,7 @@ c) Modify, adapt, translate, or create derivative works based on the Software.
 d) Distribute, sublicense, sell, rent, lease, or otherwise transfer the
    Software or any rights therein to any third party.
 
-e) Use the name "Stella", "StellaHotkey", or any related trademarks, logos,
+e) Use the name "Astra", "AstraHotkey", or any related trademarks, logos,
    or branding in any manner without prior written permission.
 
 f) Remove or alter any copyright notices, license terms, or attribution
@@ -62,7 +62,7 @@ in this License are reserved by the copyright holder.
 
 5. TRADEMARK
 
-"Stella", "StellaHotkey", and related logos and names are trademarks of the
+"Astra", "AstraHotkey", and related logos and names are trademarks of the
 copyright holder. This License does not grant permission to use these
 trademarks except as required for reasonable and customary use in describing
 the origin of the Software.

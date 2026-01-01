@@ -1,4 +1,4 @@
-//! StellaHotkey - Native global hotkey service for Stella AI assistant
+//! AstraHotkey - Native global hotkey service for Astra AI assistant
 //!
 //! This library provides efficient global hotkey detection using a registration model.
 //! Only registered hotkey combinations trigger callbacks - no data is captured or transmitted.

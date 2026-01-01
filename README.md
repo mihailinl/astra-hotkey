@@ -1,6 +1,6 @@
-# StellaHotkey
+# AstraHotkey
 
-Native global hotkey service for [Stella AI assistant](https://github.com/misha/Stella).
+Native global hotkey service for [Astra AI assistant](https://github.com/misha/Astra).
 
 ## Privacy Guarantee
 
@@ -8,20 +8,20 @@ Native global hotkey service for [Stella AI assistant](https://github.com/misha/
 
 The source code is publicly available so users can verify:
 - Only **registered** hotkey combinations trigger callbacks
-- No keystrokes are sent to Stella or any external service
+- No keystrokes are sent to Astra or any external service
 - No data collection occurs
 
 ## How It Works
 
-1. Stella registers specific hotkey combinations (e.g., `Ctrl+Shift+T`)
+1. Astra registers specific hotkey combinations (e.g., `Ctrl+Shift+T`)
 2. This library installs a low-level keyboard hook
 3. When keys are pressed, they are compared against registered hotkeys using O(1) HashSet lookup
-4. **Only matching hotkeys** invoke the callback to Stella
+4. **Only matching hotkeys** invoke the callback to Astra
 5. Non-matching keypresses are immediately passed through with no processing
 
 ```
 ┌─────────────────┐                    ┌──────────────────┐
-│   Stella C#     │     P/Invoke       │  stella_hotkey   │
+│   Astra C#      │     P/Invoke       │  astra_hotkey    │
 │                 │ ←────(~50ns)────→  │     .dll/.so     │
 │                 │                    │                  │
 │ hotkey_register │ ──────────────────→│ HashSet<Keys>    │
@@ -77,10 +77,10 @@ Examples:
 ### Build Commands
 
 ```bash
-# Windows (produces stella_hotkey.dll)
+# Windows (produces astra_hotkey.dll)
 cargo build --release
 
-# Linux (produces libstella_hotkey.so)
+# Linux (produces libastra_hotkey.so)
 cargo build --release
 
 # Cross-compile for specific targets
@@ -90,20 +90,20 @@ cargo build --release --target x86_64-unknown-linux-gnu
 
 ### Output
 
-- Windows: `target/release/stella_hotkey.dll`
-- Linux: `target/release/libstella_hotkey.so`
+- Windows: `target/release/astra_hotkey.dll`
+- Linux: `target/release/libastra_hotkey.so`
 
-## Integration with Stella
+## Integration with Astra
 
-Place the compiled library in Stella's runtime directory:
-- Windows: `runtimes/win-x64/native/stella_hotkey.dll`
-- Linux: `runtimes/linux-x64/native/libstella_hotkey.so`
+Place the compiled library in Astra's runtime directory:
+- Windows: `runtimes/win-x64/native/astra_hotkey.dll`
+- Linux: `runtimes/linux-x64/native/libastra_hotkey.so`
 
 ## License
 
 Source Available License - see [LICENSE](LICENSE) for details.
 
-This software can be viewed and audited but may only be used with Stella.
+This software can be viewed and audited but may only be used with Astra.
 
 ## Security
 

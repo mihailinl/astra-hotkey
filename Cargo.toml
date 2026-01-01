@@ -1,13 +1,13 @@
 [package]
-name = "stella_hotkey"
+name = "astra_hotkey"
 version = "0.1.0"
 edition = "2021"
-description = "Native global hotkey service for Stella AI assistant"
+description = "Native global hotkey service for Astra AI assistant"
 license = "LicenseRef-Proprietary"
-repository = "https://github.com/misha/stella-hotkey"
+repository = "https://github.com/misha/astra-hotkey"
 
 [lib]
-name = "stella_hotkey"
+name = "astra_hotkey"
 crate-type = ["cdylib"]
 
 [dependencies]
