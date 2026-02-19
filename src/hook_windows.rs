@@ -151,8 +151,8 @@ fn vk_to_key_name(vk: u32) -> Option<String> {
         // Letters A-Z (0x41-0x5A)
         0x41..=0x5A => ((vk as u8) as char).to_string(),
 
-        // Numbers 0-9 (0x30-0x39)
-        0x30..=0x39 => ((vk as u8 - 0x30) as u8 + b'0').to_string(),
+        // Numbers 0-9 (0x30-0x39) — VK codes match ASCII, same as letters
+        0x30..=0x39 => ((vk as u8) as char).to_string(),
 
         // Function keys F1-F12 (0x70-0x7B)
         0x70..=0x7B => format!("F{}", vk - 0x70 + 1),
