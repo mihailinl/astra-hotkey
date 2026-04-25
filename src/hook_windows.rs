@@ -1,17 +1,26 @@
-//! Windows-specific low-level keyboard hook implementation.
+//! Windows-specific low-level keyboard + mouse hook implementation.
 //!
-//! Uses SetWindowsHookEx with WH_KEYBOARD_LL to intercept keyboard events.
+//! Uses SetWindowsHookEx with WH_KEYBOARD_LL to intercept keyboard events
+//! and WH_MOUSE_LL for side mouse buttons (right / middle / X1 / X2).
 //! Only registered hotkey combinations trigger the callback.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::thread;
 use std::ptr;
+
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
     DispatchMessageW, TranslateMessage,
-    HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    HHOOK, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, MSG,
+    WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN,
@@ -20,8 +29,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use crate::registry::{self, Modifiers};
 use crate::invoke_callback;
 
-/// Global hook handle
+/// Tracks which VK codes are currently pressed and the matched hotkey string.
+/// Populated on key-down when a registered combo matches; consumed on key-up
+/// so we can fire the up event even if the user released modifiers first.
+static PRESSED_KEYS: Lazy<Mutex<HashMap<u32, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Same as `PRESSED_KEYS` but keyed by mouse button id (2..5) for the mouse hook.
+static PRESSED_MOUSE: Lazy<Mutex<HashMap<u32, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Global keyboard hook handle
 static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// Global mouse hook handle
+static MOUSE_HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
 
 /// Flag to signal hook thread to stop
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -35,38 +55,56 @@ pub fn start_hook() -> bool {
 
     thread::spawn(|| {
         unsafe {
-            // Install the hook
-            let hook = SetWindowsHookExW(
+            // Install the keyboard hook
+            let kbd_hook = match SetWindowsHookExW(
                 WH_KEYBOARD_LL,
                 Some(keyboard_hook_proc),
                 HINSTANCE::default(),
                 0,
-            );
-
-            match hook {
-                Ok(h) => {
-                    HOOK_HANDLE.store(h.0 as *mut _, Ordering::SeqCst);
-
-                    // Message loop to keep the hook alive
-                    let mut msg = MSG::default();
-                    while RUNNING.load(Ordering::SeqCst) {
-                        // Use GetMessage with a timeout by checking PeekMessage
-                        let result = GetMessageW(&mut msg, None, 0, 0);
-                        if result.0 == 0 || result.0 == -1 {
-                            break;
-                        }
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-
-                    // Cleanup
-                    let _ = UnhookWindowsHookEx(h);
-                    HOOK_HANDLE.store(ptr::null_mut(), Ordering::SeqCst);
-                }
+            ) {
+                Ok(h) => h,
                 Err(_) => {
                     RUNNING.store(false, Ordering::SeqCst);
+                    return;
                 }
+            };
+
+            // Install the mouse hook on the same thread so a single message
+            // pump services both. If this fails, tear the keyboard hook down
+            // so init() reports the failure cleanly.
+            let mouse_hook = match SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(mouse_hook_proc),
+                HINSTANCE::default(),
+                0,
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = UnhookWindowsHookEx(kbd_hook);
+                    RUNNING.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            HOOK_HANDLE.store(kbd_hook.0 as *mut _, Ordering::SeqCst);
+            MOUSE_HOOK_HANDLE.store(mouse_hook.0 as *mut _, Ordering::SeqCst);
+
+            // Message loop to keep both hooks alive
+            let mut msg = MSG::default();
+            while RUNNING.load(Ordering::SeqCst) {
+                let result = GetMessageW(&mut msg, None, 0, 0);
+                if result.0 == 0 || result.0 == -1 {
+                    break;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
+
+            // Cleanup
+            let _ = UnhookWindowsHookEx(kbd_hook);
+            let _ = UnhookWindowsHookEx(mouse_hook);
+            HOOK_HANDLE.store(ptr::null_mut(), Ordering::SeqCst);
+            MOUSE_HOOK_HANDLE.store(ptr::null_mut(), Ordering::SeqCst);
         }
     });
 
@@ -93,30 +131,83 @@ unsafe extern "system" fn keyboard_hook_proc(
     // If code < 0, we must pass to CallNextHookEx
     if code >= 0 {
         let event_type = wparam.0 as u32;
+        let kb_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let vk_code = kb_struct.vkCode;
 
-        // Only process key down events
         if event_type == WM_KEYDOWN || event_type == WM_SYSKEYDOWN {
-            let kb_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            let vk_code = kb_struct.vkCode;
-
             // Skip modifier-only keys
             if !is_modifier_key(vk_code) {
-                // Get current modifier state
-                let modifiers = get_current_modifiers();
-
-                // Convert virtual key to key name
-                if let Some(key_name) = vk_to_key_name(vk_code) {
-                    // Check if this combination is registered
-                    if let Some(hotkey) = registry::check_hotkey(modifiers, &key_name) {
-                        // Invoke callback
-                        invoke_callback(&hotkey);
+                // Only fire once per physical press (ignore auto-repeat)
+                let already_pressed = PRESSED_KEYS.lock().contains_key(&vk_code);
+                if !already_pressed {
+                    let modifiers = get_current_modifiers();
+                    if let Some(key_name) = vk_to_key_name(vk_code) {
+                        if let Some(hotkey) = registry::check_hotkey(modifiers, &key_name) {
+                            PRESSED_KEYS.lock().insert(vk_code, hotkey.clone());
+                            invoke_callback(&format!("{}|down", hotkey));
+                        }
                     }
                 }
+            }
+        } else if event_type == WM_KEYUP || event_type == WM_SYSKEYUP {
+            // Fire up event if we had tracked this vk_code as a matched hotkey
+            let hotkey = PRESSED_KEYS.lock().remove(&vk_code);
+            if let Some(hotkey) = hotkey {
+                invoke_callback(&format!("{}|up", hotkey));
             }
         }
     }
 
     // Always call next hook
+    CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+}
+
+/// Low-level mouse hook procedure. Maps side buttons to MOUSE2..5 names and
+/// reuses `registry::check_hotkey` so a hotkey like "Ctrl+MOUSE2" fires the
+/// same callback path as a keyboard combo. Left button is intentionally
+/// ignored — the UI also skips it to avoid hijacking ordinary clicks.
+unsafe extern "system" fn mouse_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 {
+        let msg = wparam.0 as u32;
+        let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        // For X-button events, HIWORD of mouseData is XBUTTON1 (1) or XBUTTON2 (2).
+        let xbtn = ((info.mouseData >> 16) & 0xFFFF) as u16;
+
+        let mapped: Option<(u32, &'static str, bool)> = match msg {
+            WM_RBUTTONDOWN => Some((2, "MOUSE2", true)),
+            WM_RBUTTONUP   => Some((2, "MOUSE2", false)),
+            WM_MBUTTONDOWN => Some((3, "MOUSE3", true)),
+            WM_MBUTTONUP   => Some((3, "MOUSE3", false)),
+            WM_XBUTTONDOWN if xbtn == 1 => Some((4, "MOUSE4", true)),
+            WM_XBUTTONUP   if xbtn == 1 => Some((4, "MOUSE4", false)),
+            WM_XBUTTONDOWN if xbtn == 2 => Some((5, "MOUSE5", true)),
+            WM_XBUTTONUP   if xbtn == 2 => Some((5, "MOUSE5", false)),
+            _ => None,
+        };
+
+        if let Some((id, key_name, is_down)) = mapped {
+            if is_down {
+                let already_pressed = PRESSED_MOUSE.lock().contains_key(&id);
+                if !already_pressed {
+                    let modifiers = get_current_modifiers();
+                    if let Some(hotkey) = registry::check_hotkey(modifiers, key_name) {
+                        PRESSED_MOUSE.lock().insert(id, hotkey.clone());
+                        invoke_callback(&format!("{}|down", hotkey));
+                    }
+                }
+            } else {
+                let hotkey = PRESSED_MOUSE.lock().remove(&id);
+                if let Some(hotkey) = hotkey {
+                    invoke_callback(&format!("{}|up", hotkey));
+                }
+            }
+        }
+    }
+
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
 

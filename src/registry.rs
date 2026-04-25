@@ -136,6 +136,11 @@ fn capitalize_key(key: &str) -> String {
         "numsub" | "numpadsubtract" => "NumSub".to_string(),
         "numdec" | "numpaddecimal" => "NumDec".to_string(),
         "numdiv" | "numpaddivide" => "NumDiv".to_string(),
+        // Mouse side buttons (UI sends uppercase; normalize lowercase too)
+        "mouse2" => "MOUSE2".to_string(),
+        "mouse3" => "MOUSE3".to_string(),
+        "mouse4" => "MOUSE4".to_string(),
+        "mouse5" => "MOUSE5".to_string(),
         // Symbols - keep as-is
         _ => key.to_string(),
     }
@@ -229,6 +234,27 @@ mod tests {
         assert_eq!(normalize_hotkey("Alt+F4"), "Alt+F4");
         assert_eq!(normalize_hotkey("Win+E"), "Win+E");
         assert_eq!(normalize_hotkey("meta+e"), "Win+E");
+    }
+
+    #[test]
+    fn test_normalize_mouse_hotkey() {
+        // UI emits uppercase MOUSE2..5; we should accept lowercase too.
+        assert_eq!(normalize_hotkey("Ctrl+MOUSE3"), "Ctrl+MOUSE3");
+        assert_eq!(normalize_hotkey("ctrl+mouse3"), "Ctrl+MOUSE3");
+        assert_eq!(normalize_hotkey("alt+shift+mouse4"), "Alt+Shift+MOUSE4");
+        assert_eq!(normalize_hotkey("MOUSE2"), "MOUSE2");
+    }
+
+    #[test]
+    fn test_register_and_match_mouse_hotkey() {
+        unregister_all();
+        assert!(register_hotkey("Ctrl+MOUSE2"));
+        let modifiers = Modifiers { ctrl: true, alt: false, shift: false, win: false };
+        assert_eq!(check_hotkey(modifiers, "MOUSE2"), Some("Ctrl+MOUSE2".to_string()));
+        // Wrong modifiers: no match.
+        let no_mod = Modifiers::default();
+        assert_eq!(check_hotkey(no_mod, "MOUSE2"), None);
+        unregister_all();
     }
 
     #[test]

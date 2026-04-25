@@ -2,6 +2,11 @@
 //!
 //! Uses XGrabKey to register hotkeys with the X server.
 //! Only registered hotkey combinations trigger the callback.
+//!
+//! TODO: mouse-button hotkeys (MOUSE2/3/4/5) are unimplemented here. The
+//! Windows backend handles them via WH_MOUSE_LL; on X11 this would require
+//! XGrabButton + ButtonPress/ButtonRelease events. Astra Desktop currently
+//! ships Windows-only, so this is deferred.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
