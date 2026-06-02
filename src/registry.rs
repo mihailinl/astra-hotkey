@@ -154,6 +154,12 @@ pub fn register_hotkey(keys: &str) -> bool {
         return false;
     }
 
+    // On Linux the actual OS grab is performed by the X11 backend; the set is
+    // kept for `count()`/`is_registered()`. On Windows the low-level hook reads
+    // the set directly via `check_hotkey`.
+    #[cfg(target_os = "linux")]
+    let _ = crate::hook_linux::register(&normalized);
+
     let mut hotkeys = REGISTERED_HOTKEYS.write();
     hotkeys.insert(normalized)
 }
@@ -162,12 +168,16 @@ pub fn register_hotkey(keys: &str) -> bool {
 /// Returns true if the hotkey was registered, false otherwise.
 pub fn unregister_hotkey(keys: &str) -> bool {
     let normalized = normalize_hotkey(keys);
+    #[cfg(target_os = "linux")]
+    let _ = crate::hook_linux::unregister(&normalized);
     let mut hotkeys = REGISTERED_HOTKEYS.write();
     hotkeys.remove(&normalized)
 }
 
 /// Unregister all hotkeys.
 pub fn unregister_all() {
+    #[cfg(target_os = "linux")]
+    crate::hook_linux::unregister_all();
     let mut hotkeys = REGISTERED_HOTKEYS.write();
     hotkeys.clear();
 }
@@ -188,7 +198,10 @@ pub fn count() -> usize {
 }
 
 /// Check pressed keys against registered hotkeys and return matching hotkey if found.
-/// Takes current modifiers and a regular key.
+/// Takes current modifiers and a regular key. Used by the Windows low-level
+/// hook; on Linux the X11/portal backends match by their own registered set, so
+/// this is unused there.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn check_hotkey(modifiers: Modifiers, key: &str) -> Option<String> {
     // Build the hotkey string from current state
     let mut parts = Vec::new();
@@ -225,6 +238,12 @@ pub fn check_hotkey(modifiers: Modifiers, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // The register/check tests mutate the shared `REGISTERED_HOTKEYS` static, so
+    // cargo's parallel runner could otherwise race one test's `unregister_all()`
+    // against another's assertions. Serialize them through this lock.
+    // (parking_lot::Mutex doesn't poison on a failing assert.)
+    static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn test_normalize_hotkey() {
         assert_eq!(normalize_hotkey("Ctrl+T"), "Ctrl+T");
@@ -247,6 +266,7 @@ mod tests {
 
     #[test]
     fn test_register_and_match_mouse_hotkey() {
+        let _serial = SERIAL.lock();
         unregister_all();
         assert!(register_hotkey("Ctrl+MOUSE2"));
         let modifiers = Modifiers { ctrl: true, alt: false, shift: false, win: false };
@@ -259,6 +279,7 @@ mod tests {
 
     #[test]
     fn test_register_unregister() {
+        let _serial = SERIAL.lock();
         unregister_all();
 
         assert!(register_hotkey("Ctrl+T"));
@@ -275,6 +296,7 @@ mod tests {
 
     #[test]
     fn test_check_hotkey() {
+        let _serial = SERIAL.lock();
         unregister_all();
         register_hotkey("Ctrl+Shift+T");
 
