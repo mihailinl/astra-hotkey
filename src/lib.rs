@@ -214,6 +214,19 @@ pub extern "C" fn hotkey_backend() -> *const c_char {
     }
 }
 
+/// Install a diagnostic log callback. The library routes all portal / X11
+/// backend diagnostics (`CreateSession`/`BindShortcuts`/`Activated` failures,
+/// JSON parse errors, X11 grab failures) through it so the daemon can forward
+/// them into its `tracing` sink (`daemon.log`). `level`: 0=error, 1=warn,
+/// 2=info, 3=debug. Without it the library falls back to `eprintln!`.
+///
+/// # Safety
+/// The callback must remain valid for the lifetime of the hotkey service.
+#[no_mangle]
+pub extern "C" fn hotkey_set_log_callback(cb: extern "C" fn(u8, *const c_char)) {
+    backend::set_log_callback(cb);
+}
+
 /// id-based init. `on_activated(id, pressed)` fires per shortcut activation;
 /// `on_bindings_changed()` fires when the actual bindings change (portal rebind,
 /// `ShortcutsChanged`, or an owned re-register) so the daemon re-reads
@@ -263,7 +276,7 @@ pub extern "C" fn hotkey_set_shortcuts(json: *const c_char) -> bool {
     let specs: Vec<backend::ShortcutSpec> = match serde_json::from_str(s) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[astra-hotkey] hotkey_set_shortcuts: invalid JSON: {e}");
+            backend::log_error(format!("hotkey_set_shortcuts: invalid JSON: {e}"));
             return false;
         }
     };

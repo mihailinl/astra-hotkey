@@ -49,7 +49,7 @@ pub fn start_hook() -> bool {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[astra-hotkey] X11 GlobalHotKeyManager init failed: {e}");
+            crate::backend::log_error(format!("X11 GlobalHotKeyManager init failed: {e}"));
             RUNNING.store(false, Ordering::SeqCst);
             return false;
         }
@@ -104,7 +104,7 @@ fn parse_combo(combo: &str) -> Option<HotKey> {
 /// Register (grab) a combo. Returns `true` if the grab succeeded.
 pub fn register(combo: &str) -> bool {
     let Some(hk) = parse_combo(combo) else {
-        eprintln!("[astra-hotkey] cannot parse hotkey '{combo}'");
+        crate::backend::log_warn(format!("cannot parse hotkey '{combo}'"));
         return false;
     };
     let Some(state) = STATE.get() else { return false };
@@ -118,7 +118,7 @@ pub fn register(combo: &str) -> bool {
             true
         }
         Err(e) => {
-            eprintln!("[astra-hotkey] failed to register '{combo}': {e}");
+            crate::backend::log_warn(format!("failed to register '{combo}': {e}"));
             false
         }
     }

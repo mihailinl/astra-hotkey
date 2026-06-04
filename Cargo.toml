@@ -37,7 +37,7 @@ global-hotkey = "0.6"
 # the cdylib runs its own current-thread tokio runtime on a background thread
 # (the portal "actor"). futures-util gives us StreamExt::next for the signal
 # streams in the select loop.
-ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Runtime session detection (x11 vs wayland) handled via env in linux.rs.

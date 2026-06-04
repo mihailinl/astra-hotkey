@@ -185,6 +185,63 @@ pub fn invoke_bindings_changed() {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostic log funnel → the daemon's `tracing` sink.
+//
+// The portal actor / X11 hook used to `eprintln!` straight to the process
+// stderr fd, which the daemon's `tracing_appender` file layer never captures —
+// so every Wayland bind/activation failure was invisible in `daemon.log`. We
+// now route diagnostics through an optional C callback the daemon installs
+// (`hotkey_set_log_callback`); it forwards each line to `tracing` under target
+// `astra_daemon::ffi::hotkey`. If no callback is installed (older daemon, or a
+// direct test harness) we fall back to `eprintln!` so messages are never lost.
+// ---------------------------------------------------------------------------
+
+/// Log levels crossing the C boundary (kept in lockstep with the daemon-side
+/// `hotkey_log_callback` match in `ffi/hotkey.rs`).
+pub const LOG_ERROR: u8 = 0;
+pub const LOG_WARN: u8 = 1;
+pub const LOG_INFO: u8 = 2;
+pub const LOG_DEBUG: u8 = 3;
+
+type LogCb = extern "C" fn(u8, *const c_char);
+static LOG_CB: OnceCell<Mutex<Option<LogCb>>> = OnceCell::new();
+
+/// Install the daemon's log callback (idempotent — last writer wins, harmless).
+pub fn set_log_callback(cb: LogCb) {
+    let cell = LOG_CB.get_or_init(|| Mutex::new(None));
+    *cell.lock() = Some(cb);
+}
+
+/// Emit a diagnostic line at `level`. Copies the fn-pointer out before calling
+/// (same non-reentrant-lock discipline as the other funnels).
+pub fn log(level: u8, msg: &str) {
+    let cb = LOG_CB.get().and_then(|cell| *cell.lock());
+    match cb {
+        Some(cb) => {
+            if let Ok(c) = std::ffi::CString::new(msg) {
+                cb(level, c.as_ptr());
+            }
+        }
+        // No daemon callback installed → keep the legacy stderr breadcrumb.
+        None => eprintln!("[astra-hotkey] {msg}"),
+    }
+}
+
+/// Convenience wrappers so call sites read like `tracing` macros.
+pub fn log_error(msg: String) {
+    log(LOG_ERROR, &msg);
+}
+pub fn log_warn(msg: String) {
+    log(LOG_WARN, &msg);
+}
+pub fn log_info(msg: String) {
+    log(LOG_INFO, &msg);
+}
+pub fn log_debug(msg: String) {
+    log(LOG_DEBUG, &msg);
+}
+
+// ---------------------------------------------------------------------------
 // Owned-backend (Win32 / X11) combo→id table + the live bindings cache.
 // ---------------------------------------------------------------------------
 

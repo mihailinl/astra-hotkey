@@ -43,9 +43,11 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
 
+use std::str::FromStr;
+
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut, Shortcut};
 use ashpd::desktop::Session;
-use ashpd::WindowIdentifier;
+use ashpd::AppID;
 use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -69,6 +71,19 @@ enum Command {
 static CMD_TX: Lazy<Mutex<Option<mpsc::UnboundedSender<Command>>>> = Lazy::new(|| Mutex::new(None));
 /// `true` between a successful `start()` and the actor's exit.
 static ACTOR_ALIVE: AtomicBool = AtomicBool::new(false);
+
+/// Stable application identity for the portal. The daemon writes a matching
+/// `tech.knicetech.astra-daemon.desktop` (with a findable `Exec`) before we run —
+/// see `astra-daemon`'s `ensure_portal_desktop_entry`. The portal only registers
+/// an app id whose `<id>.desktop` exists AND whose `Exec` program resolves (a
+/// non-findable `Exec` → "App info not found"); a daemon-owned entry pointed at
+/// the running binary guarantees both. Registering this fixed id makes
+/// xdg-desktop-portal file our global shortcuts under ONE component regardless of
+/// which build (debug / release / bundle) is running — see [`register_app`].
+///
+/// MUST stay in lockstep with `astra-daemon` `ensure_portal_desktop_entry`'s
+/// `APP_ID` (the `.desktop` basename it writes).
+const APP_ID: &str = "tech.knicetech.astra-daemon";
 
 /// Bound on `CreateSession` at startup — it does not show a dialog, so a short
 /// wait is safe; if the portal is missing/slow we fall back to Unsupported.
@@ -99,7 +114,7 @@ pub fn start() -> bool {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("[astra-hotkey] portal: tokio runtime build failed: {e}");
+                    backend::log_error(format!("portal: tokio runtime build failed: {e}"));
                     let _ = ready_tx.send(false);
                     return;
                 }
@@ -159,10 +174,16 @@ fn mark_dead() {
 /// The portal actor: owns the proxy, session and signal streams for its whole
 /// life and never lets them cross a thread boundary.
 async fn actor_main(mut cmd_rx: mpsc::UnboundedReceiver<Command>, ready_tx: std_mpsc::Sender<bool>) {
+    // Pin our application identity BEFORE any other portal call (the Registry
+    // requires it). This uses ashpd's shared session connection — the very one
+    // GlobalShortcuts::new() below reuses — so the compositor attributes our
+    // shortcuts to a stable app id instead of the per-build executable path.
+    register_app().await;
+
     let shortcuts = match GlobalShortcuts::new().await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[astra-hotkey] portal: GlobalShortcuts proxy failed: {e}");
+            backend::log_error(format!("portal: GlobalShortcuts proxy failed: {e}"));
             let _ = ready_tx.send(false);
             return;
         }
@@ -170,7 +191,7 @@ async fn actor_main(mut cmd_rx: mpsc::UnboundedReceiver<Command>, ready_tx: std_
     let mut session = match shortcuts.create_session().await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[astra-hotkey] portal: CreateSession failed (portal unavailable?): {e}");
+            backend::log_warn(format!("portal: CreateSession failed (portal unavailable?): {e}"));
             let _ = ready_tx.send(false);
             return;
         }
@@ -182,7 +203,7 @@ async fn actor_main(mut cmd_rx: mpsc::UnboundedReceiver<Command>, ready_tx: std_
     let mut activated = match shortcuts.receive_activated().await {
         Ok(s) => Box::pin(s),
         Err(e) => {
-            eprintln!("[astra-hotkey] portal: receive_activated failed: {e}");
+            backend::log_error(format!("portal: receive_activated failed: {e}"));
             let _ = ready_tx.send(false);
             return;
         }
@@ -190,19 +211,20 @@ async fn actor_main(mut cmd_rx: mpsc::UnboundedReceiver<Command>, ready_tx: std_
     let mut deactivated = match shortcuts.receive_deactivated().await {
         Ok(s) => Some(Box::pin(s)),
         Err(e) => {
-            eprintln!("[astra-hotkey] portal: receive_deactivated unavailable: {e}");
+            backend::log_warn(format!("portal: receive_deactivated unavailable: {e}"));
             None
         }
     };
     let mut changed = match shortcuts.receive_shortcuts_changed().await {
         Ok(s) => Some(Box::pin(s)),
         Err(e) => {
-            eprintln!("[astra-hotkey] portal: receive_shortcuts_changed unavailable: {e}");
+            backend::log_warn(format!("portal: receive_shortcuts_changed unavailable: {e}"));
             None
         }
     };
 
     // Session created — the portal is usable.
+    backend::log_info("portal: GlobalShortcuts session created — backend ready".to_string());
     let _ = ready_tx.send(true);
 
     // The set we last bound. Kept so we can (a) skip no-op rebinds, (b) decide
@@ -225,21 +247,30 @@ async fn actor_main(mut cmd_rx: mpsc::UnboundedReceiver<Command>, ready_tx: std_
                         match recreate_session(&shortcuts, &mut session).await {
                             Ok(()) => {}
                             Err(e) => {
-                                eprintln!("[astra-hotkey] portal: session recreate failed: {e}");
+                                backend::log_error(format!("portal: session recreate failed: {e}"));
                                 continue;
                             }
                         }
                     }
                     current = specs;
+                    backend::log_info(format!(
+                        "portal: binding {} shortcut(s) to the compositor",
+                        current.len()
+                    ));
                     bind_set(&shortcuts, &session, &current).await;
                 }
                 Some(Command::Configure(_id)) => {
                     // No per-shortcut configure verb exists; recreate the session
                     // and re-bind the whole set to re-present the compositor's UI.
                     if let Err(e) = recreate_session(&shortcuts, &mut session).await {
-                        eprintln!("[astra-hotkey] portal: session recreate (configure) failed: {e}");
+                        backend::log_error(format!(
+                            "portal: session recreate (configure) failed: {e}"
+                        ));
                         continue;
                     }
+                    backend::log_info(
+                        "portal: re-presenting the compositor bind dialog (configure)".to_string(),
+                    );
                     let specs = current.clone();
                     bind_set(&shortcuts, &session, &specs).await;
                 }
@@ -247,9 +278,14 @@ async fn actor_main(mut cmd_rx: mpsc::UnboundedReceiver<Command>, ready_tx: std_
             },
 
             act = activated.next() => match act {
-                Some(a) => backend::invoke_activated(a.shortcut_id(), true),
+                Some(a) => {
+                    backend::log_debug(format!("portal: Activated id={}", a.shortcut_id()));
+                    backend::invoke_activated(a.shortcut_id(), true);
+                }
                 None => {
-                    eprintln!("[astra-hotkey] portal: Activated stream ended (D-Bus connection dropped)");
+                    backend::log_warn(
+                        "portal: Activated stream ended (D-Bus connection dropped)".to_string(),
+                    );
                     bus_dropped = true;
                     break;
                 }
@@ -258,7 +294,10 @@ async fn actor_main(mut cmd_rx: mpsc::UnboundedReceiver<Command>, ready_tx: std_
             // Optional streams: a `None` means the stream terminated — drop it so
             // we stop polling a dead stream (which would otherwise busy-spin).
             maybe_deact = next_opt(&mut deactivated) => match maybe_deact {
-                Some(d) => backend::invoke_activated(d.shortcut_id(), false),
+                Some(d) => {
+                    backend::log_debug(format!("portal: Deactivated id={}", d.shortcut_id()));
+                    backend::invoke_activated(d.shortcut_id(), false);
+                }
                 None => deactivated = None,
             },
             maybe_changed = next_opt(&mut changed) => match maybe_changed {
@@ -278,6 +317,30 @@ async fn actor_main(mut cmd_rx: mpsc::UnboundedReceiver<Command>, ready_tx: std_
         backend::mark_all_unsupported();
         backend::invoke_bindings_changed();
         mark_dead();
+    }
+}
+
+/// Register our stable [`APP_ID`] with the host portal Registry so the compositor
+/// attributes our global shortcuts to ONE component instead of the daemon's
+/// executable path (which otherwise fragments debug / release / bundle into
+/// separate KDE components that conflict over the same key).
+///
+/// The portal accepts the id iff `<APP_ID>.desktop` is discoverable AND its
+/// `Exec` program resolves — the daemon's `ensure_portal_desktop_entry` writes
+/// exactly such an entry (Exec = the running daemon binary) before we start, so
+/// this now succeeds for dev `cargo run` builds too. Still best-effort: a portal
+/// without the Registry interface (or a missing entry) just logs at debug and the
+/// compositor falls back to the per-path identity — no regression either way.
+async fn register_app() {
+    match AppID::from_str(APP_ID) {
+        Ok(app_id) => match ashpd::register_host_app(app_id).await {
+            Ok(()) => backend::log_info(format!("portal: registered app id '{APP_ID}'")),
+            Err(e) => backend::log_debug(format!(
+                "portal: register_host_app('{APP_ID}') not applied (expected for dev / \
+                 non-packaged runs; compositor uses the per-path identity): {e}"
+            )),
+        },
+        Err(e) => backend::log_warn(format!("portal: invalid app id '{APP_ID}': {e}")),
     }
 }
 
@@ -328,17 +391,20 @@ async fn bind_set(
         })
         .collect();
 
-    let win = WindowIdentifier::default();
-    let fut = shortcuts.bind_shortcuts(session, &new_shortcuts, &win);
+    // No parent window — the bind dialog is a global affordance, not anchored to
+    // one of our windows (the daemon has none on the portal path). ashpd 0.11
+    // takes `Option<&WindowIdentifier>`; `None` is the empty identifier the
+    // previous `WindowIdentifier::default()` produced.
+    let fut = shortcuts.bind_shortcuts(session, &new_shortcuts, None);
     match tokio::time::timeout(BIND_TIMEOUT, fut).await {
         Ok(Ok(request)) => match request.response() {
             Ok(resp) => apply_shortcuts(desired, resp.shortcuts()),
-            Err(e) => eprintln!("[astra-hotkey] portal: BindShortcuts response error: {e}"),
+            Err(e) => backend::log_warn(format!("portal: BindShortcuts response error: {e}")),
         },
-        Ok(Err(e)) => eprintln!("[astra-hotkey] portal: BindShortcuts failed: {e}"),
-        Err(_) => eprintln!(
-            "[astra-hotkey] portal: BindShortcuts timed out after {BIND_TIMEOUT:?} (dialog abandoned?)"
-        ),
+        Ok(Err(e)) => backend::log_warn(format!("portal: BindShortcuts failed: {e}")),
+        Err(_) => backend::log_warn(format!(
+            "portal: BindShortcuts timed out after {BIND_TIMEOUT:?} (dialog abandoned?)"
+        )),
     }
 }
 
@@ -363,6 +429,24 @@ fn apply_shortcuts(desired: &[ShortcutSpec], bound: &[Shortcut]) {
             },
         })
         .collect();
+
+    // One breadcrumb per shortcut so the daemon log shows exactly which roles the
+    // compositor bound vs. silently declined (NeedsBinding) — the data that was
+    // previously invisible when an overlay/PTT key "did nothing".
+    for b in &bindings {
+        match b.status {
+            BindingStatus::Bound => backend::log_info(format!(
+                "portal: bound {} -> {}",
+                b.id,
+                b.combo.as_deref().unwrap_or("?")
+            )),
+            BindingStatus::NeedsBinding => backend::log_warn(format!(
+                "portal: {} NOT bound (compositor declined / awaiting user accept)",
+                b.id
+            )),
+            BindingStatus::Unsupported => {}
+        }
+    }
 
     backend::set_bindings(bindings);
     backend::invoke_bindings_changed();
