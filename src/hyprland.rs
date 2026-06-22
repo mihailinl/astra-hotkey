@@ -466,18 +466,40 @@ pub fn run_consent(cfg: &HyprConfig) -> bool {
         );
         return false;
     };
+    // Make sure the Astra-owned file exists before the dialog so its "View" button
+    // and the include line both target a real file (it's normally written at sync,
+    // but a user may have removed it).
+    {
+        let desired = LAST_DESIRED.lock().clone();
+        let binds: Vec<Bind> = desired
+            .iter()
+            .filter_map(|s| {
+                let combo = s.preferred.as_deref().map(str::trim).filter(|c| !c.is_empty())?;
+                Some(Bind { id: &s.id, description: &s.description, combo })
+            })
+            .collect();
+        if let Err(e) = write_managed(cfg, &binds) {
+            backend::log_warn(format!("hyprland: pre-consent write {:?} failed: {e}", cfg.managed_file));
+        }
+    }
     let target = cfg.include_target.clone();
     let line = cfg.include_line.clone();
     let managed = cfg.managed_file.clone();
+    // The daemon stashes the UI's chosen language here so the dialog matches the
+    // app (the system LANG may differ from the user's Astra locale).
+    let ui_locale = std::env::var("ASTRA_UI_LOCALE").ok().filter(|s| !s.is_empty());
     std::thread::spawn(move || {
-        let status = std::process::Command::new(&helper)
-            .arg("--target")
+        let mut cmd = std::process::Command::new(&helper);
+        cmd.arg("--target")
             .arg(&target)
             .arg("--line")
             .arg(&line)
             .arg("--managed")
-            .arg(&managed)
-            .status();
+            .arg(&managed);
+        if let Some(loc) = &ui_locale {
+            cmd.arg("--lang").arg(loc);
+        }
+        let status = cmd.status();
         match status {
             Ok(s) if s.success() => match append_include(&target, &line) {
                 Ok(_) => {
