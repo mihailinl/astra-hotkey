@@ -231,6 +231,20 @@ fn hypr_keysym(key: &str) -> String {
 /// `None` if the combo lacks a real key.
 pub fn bind_line(parser: Parser, b: &Bind) -> Option<String> {
     let (mods, key) = combo_to_hypr(b.combo)?;
+    // SECURITY: the id and key are interpolated into the generated config with NO
+    // escape mechanism in the legacy dialect, and an id can originate from
+    // shared / marketplace command content (its `astra.command.<node_id>` carries
+    // the published node id). Refuse anything outside a strict allowlist so a
+    // crafted id/key can't close the `hl.bind(...)` call and inject arbitrary Lua,
+    // or add an `exec` directive in the legacy dialect, that runs on `hyprctl
+    // reload`. Honest ids are `astra.command.<nanoid>` and keys are alnum keysyms.
+    if !is_safe_shortcut_id(b.id) || !is_safe_hypr_key(&key) {
+        backend::log_warn(format!(
+            "hyprland: refusing unsafe shortcut id/key (id={:?}, key={:?}) — not binding",
+            b.id, key
+        ));
+        return None;
+    }
     let target = format!("{APP_ID}:{}", b.id);
     Some(match parser {
         Parser::Lua => {
@@ -249,8 +263,33 @@ pub fn bind_line(parser: Parser, b: &Bind) -> Option<String> {
     })
 }
 
+/// A shortcut id is safe to interpolate into the config iff it's a strict
+/// allowlist — alphanumerics plus the separators our ids legitimately use
+/// (`astra.command.<nanoid>`). No quotes / parens / whitespace / control chars,
+/// so neither the Lua nor the legacy dialect can be injected.
+fn is_safe_shortcut_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// A Hyprland key token is safe iff alphanumeric (all our keysyms are: letters,
+/// digits, `F1`, `slash`, `space`, …). Rejects anything a crafted combo could
+/// smuggle through the `hypr_keysym` pass-through fallback.
+fn is_safe_hypr_key(key: &str) -> bool {
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Escape a free-form string for a Lua double-quoted literal, including control
+/// chars (a command NAME with a newline would otherwise produce an unparseable
+/// `astra.lua` and silently disable the user's hotkeys).
 fn lua_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 /// Render the full Astra-owned config file from the desired binds.
@@ -584,9 +623,12 @@ fn line_present(content: &str, line: &str) -> bool {
 }
 
 /// Append the include line to the target file if missing. Used by the consent
-/// helper (and unit-tested here). Idempotent. Creates the file if absent ONLY
-/// when its parent dir already exists (never fabricates a brand-new entry config
-/// out of nowhere). Returns whether a write happened.
+/// helper (and unit-tested here). Idempotent. **Only appends to a file that
+/// already exists** — it never CREATES the entry config. Creating a brand-new
+/// top-level `hyprland.conf` containing just our `source` line would shadow
+/// Hyprland's compiled-in defaults and break the desktop; if the target is
+/// absent we return `Ok(false)` and the caller falls back to showing the manual
+/// include line. Returns whether a write happened.
 pub fn append_include(target: &Path, line: &str) -> std::io::Result<bool> {
     // Hyprland's legacy `.conf` comments with `#`; the Lua config with `--`.
     let comment = if target.extension().map(|e| e == "conf").unwrap_or(false) {
@@ -610,16 +652,11 @@ pub fn append_include(target: &Path, line: &str) -> std::io::Result<bool> {
             std::fs::write(target, new)?;
             Ok(true)
         }
-        // No file yet: only create inside an established hypr dir (never fabricate
-        // a brand-new entry config — an almost-empty one would strip Hyprland's
-        // compiled-in defaults).
-        Err(_) => match target.parent() {
-            Some(parent) if parent.is_dir() => {
-                std::fs::write(target, block.trim_start_matches('\n'))?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        },
+        // No file yet: do NOT fabricate the entry config. A brand-new top-level
+        // hyprland.conf with only our `source` line would shadow Hyprland's
+        // compiled-in defaults and break the desktop (S2). Refuse — the caller
+        // surfaces the manual include line instead.
+        Err(_) => Ok(false),
     }
 }
 
@@ -673,6 +710,45 @@ mod tests {
         let legacy = render_managed(Parser::Legacy, &binds);
         assert!(legacy.starts_with("# Astra-managed"));
         assert!(legacy.contains("bind = CTRL ALT, P, global, tech.knicetech.astra-daemon:astra.overlay"));
+    }
+
+    #[test]
+    fn bind_line_rejects_injection_in_id_and_key() {
+        // A crafted shortcut id (e.g. from shared/marketplace content) that tries
+        // to close the hl.bind(...) call and inject Lua must be refused outright.
+        let evil_id = Bind {
+            id: "astra.command.x\")) hl.dispatch(hl.dsp.exec_cmd(\"calc",
+            description: "d",
+            combo: "Ctrl+P",
+        };
+        assert!(bind_line(Parser::Lua, &evil_id).is_none());
+        assert!(bind_line(Parser::Legacy, &evil_id).is_none());
+        // A crafted key token (smuggled through the keysym pass-through) too.
+        let evil_key = Bind { id: "astra.overlay", description: "d", combo: "Ctrl+a\");x(" };
+        assert!(bind_line(Parser::Lua, &evil_key).is_none());
+        // Honest ids/keys still pass.
+        let ok = Bind { id: "astra.command.V1StGXR8_Z5jdHi6B-myT", description: "d", combo: "Ctrl+P" };
+        assert!(bind_line(Parser::Lua, &ok).is_some());
+    }
+
+    #[test]
+    fn lua_escape_neutralizes_newlines_and_quotes() {
+        let e = lua_escape("evil\"\n) end --");
+        assert!(!e.contains('\n'));
+        assert!(!e.contains("\"\n"));
+        assert_eq!(lua_escape("a\\b\"c"), "a\\\\b\\\"c");
+    }
+
+    #[test]
+    fn append_include_refuses_to_create_missing_entry() {
+        // The dangerous case: the hypr dir exists but the entry config does not.
+        // We must NOT fabricate it (that would shadow Hyprland's defaults).
+        let dir = std::env::temp_dir().join(format!("astra-hk-noentry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("hyprland.conf"); // does not exist
+        assert!(!append_include(&target, "source = /x").unwrap());
+        assert!(!target.exists(), "must not fabricate an entry config");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
