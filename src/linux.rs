@@ -14,8 +14,8 @@
 //! grab in `registry`/`hook_linux`) and record combo→id in `backend`, so the
 //! shared `invoke_callback` funnel turns a fired combo into `on_activated(id)`.
 
-use crate::backend::{self, BindingStatus, Provider, ShortcutBinding, ShortcutSpec};
-use crate::{hook_linux, hook_wayland, registry};
+use crate::backend::{self, BindingStatus, PortalModel, Provider, ShortcutBinding, ShortcutSpec};
+use crate::{hook_linux, hook_wayland, hyprland, registry};
 
 /// Is this a Wayland session? Prefer the explicit session type, fall back to the
 /// presence of a Wayland display socket.
@@ -47,6 +47,16 @@ pub fn init() -> bool {
     if is_wayland() {
         if hook_wayland::start() {
             backend::set_provider(Provider::Portal);
+            // Pick the portal binding model up front (the daemon queries it via
+            // `hotkey_portal_model()` to choose the shortcut-id scheme BEFORE the
+            // first bind): Hyprland/wlroots register the id but expect the user to
+            // bind a key in their config (Manual); KDE/GNOME pop a dialog and bind
+            // it themselves (Dialog).
+            backend::set_portal_model(if hyprland::is_hyprland() {
+                PortalModel::Manual
+            } else {
+                PortalModel::Dialog
+            });
             return true;
         }
         // Wayland but no usable portal.
@@ -82,6 +92,7 @@ pub fn set_shortcuts(specs: Vec<ShortcutSpec>) -> bool {
                     combo: None,
                     status: BindingStatus::Unsupported,
                     description: s.description,
+                    bind_hint: None,
                 })
                 .collect();
             backend::set_bindings(bindings);
@@ -94,7 +105,17 @@ pub fn set_shortcuts(specs: Vec<ShortcutSpec>) -> bool {
 /// backends use the daemon's in-app recorder, so this is a no-op there.
 pub fn configure(id: &str) -> bool {
     match backend::provider() {
-        Provider::Portal => hook_wayland::configure(id),
+        Provider::Portal => match backend::portal_model() {
+            // Manual-bind (Hyprland): "configure" means run the one-time config
+            // setup — show the native consent diff to add the include line, then
+            // reload. The bind lines themselves were already written on sync.
+            PortalModel::Manual => match hyprland::detect() {
+                Some(cfg) => hyprland::run_consent(&cfg),
+                None => false,
+            },
+            // Dialog (KDE/GNOME): re-present the compositor's own bind dialog.
+            _ => hook_wayland::configure(id),
+        },
         _ => false,
     }
 }
@@ -142,6 +163,7 @@ fn set_owned(specs: Vec<ShortcutSpec>) {
                 combo: None,
                 status: BindingStatus::NeedsBinding,
                 description: spec.description,
+                bind_hint: None,
             },
             Some(normalized) => {
                 let ok = hook_linux::register(&normalized); // real XGrabKey result
@@ -154,6 +176,7 @@ fn set_owned(specs: Vec<ShortcutSpec>) {
                         BindingStatus::NeedsBinding
                     },
                     description: spec.description,
+                    bind_hint: None,
                 }
             }
         })

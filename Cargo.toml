@@ -10,6 +10,18 @@ repository = "https://github.com/misha/astra-hotkey"
 name = "astra_hotkey"
 crate-type = ["cdylib"]
 
+# The native GTK consent dialog (Hyprland manual-bind setup). Built ONLY with the
+# `consent-gtk` feature so the dlopened cdylib never links GTK; it runs as its own
+# process with its own GTK main loop. Linux-only (gtk4 dep is target-gated).
+[[bin]]
+name = "astra-hotkey-consent"
+path = "src/bin/consent.rs"
+required-features = ["consent-gtk"]
+
+[features]
+# Build the GTK4 consent helper binary.
+consent-gtk = ["dep:gtk4"]
+
 [dependencies]
 once_cell = "1.19"
 parking_lot = "0.12"
@@ -41,6 +53,9 @@ ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Runtime session detection (x11 vs wayland) handled via env in linux.rs.
+# GTK4 for the optional `astra-hotkey-consent` helper binary (Hyprland setup
+# dialog). Optional + feature-gated so the cdylib never pulls in GTK.
+gtk4 = { version = "0.9", optional = true }
 
 [profile.release]
 lto = true

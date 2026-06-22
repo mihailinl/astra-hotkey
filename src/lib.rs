@@ -19,6 +19,8 @@ mod hook_linux;
 #[cfg(target_os = "linux")]
 mod hook_wayland;
 #[cfg(target_os = "linux")]
+mod hyprland;
+#[cfg(target_os = "linux")]
 mod linux;
 
 use std::ffi::{c_char, CStr, CString};
@@ -211,6 +213,43 @@ pub extern "C" fn hotkey_backend() -> *const c_char {
     #[cfg(not(any(windows, target_os = "linux")))]
     {
         c"none".as_ptr()
+    }
+}
+
+/// The portal **binding model** when the backend is `portal`: `"dialog"` (KDE /
+/// GNOME — the compositor's dialog binds the key), `"manual"` (Hyprland / wlroots
+/// — the user binds the key in their config via the `global` dispatcher; Astra
+/// writes the lines + offers a consent dialog), or `"none"`. The daemon queries
+/// this right after `hotkey_init2` to choose the shortcut-id scheme (stable on
+/// manual, `#combo`-suffixed on dialog). Returns a `'static` C string — do **not**
+/// pass it to `hotkey_free`.
+#[no_mangle]
+pub extern "C" fn hotkey_portal_model() -> *const c_char {
+    #[cfg(target_os = "linux")]
+    {
+        backend::portal_model().as_cstr().as_ptr()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        c"none".as_ptr()
+    }
+}
+
+/// Compositor-config state for the UI (manual-bind model). JSON object:
+/// `{ "model", "parser", "managed_file", "include_target", "include_present",
+/// "needs_setup" }`. `needs_setup` is `true` when the model is manual and the
+/// one-time include line is not yet active — the UI surfaces a "set up" action
+/// that calls `hotkey_configure`. The returned pointer is heap-allocated — free
+/// it with [`hotkey_free`]. Returns an empty-state object off Linux.
+#[no_mangle]
+pub extern "C" fn hotkey_compositor_info() -> *mut c_char {
+    #[cfg(target_os = "linux")]
+    let json = hyprland::compositor_info_json();
+    #[cfg(not(target_os = "linux"))]
+    let json = "{\"model\":\"none\",\"parser\":\"unknown\",\"managed_file\":\"\",\"include_target\":\"\",\"include_present\":false,\"needs_setup\":false}".to_string();
+    match CString::new(json) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 

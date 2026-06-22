@@ -47,6 +47,71 @@ pub enum Provider {
     Unsupported = 4,
 }
 
+/// How the selected **portal** compositor binds keys to shortcut ids — the axis
+/// that separates KDE from Hyprland/wlroots within `Provider::Portal`.
+///
+/// - [`PortalModel::Dialog`] (KDE): `BindShortcuts` pops a confirm dialog and the
+///   compositor applies `preferred_trigger` (or what the user picks). The actual
+///   key comes back in the bind response. Changing a key needs a fresh dialog, so
+///   the daemon encodes the combo into the shortcut id (`<role>#<combo>`).
+/// - [`PortalModel::Manual`] (Hyprland, wlroots): `BindShortcuts` registers the id
+///   but binds **no** key and shows **no** dialog — the user must bind a key via
+///   the compositor's `global` dispatcher in their config. `preferred_trigger` is
+///   ignored (the response trigger is empty). Here Astra writes the bind lines to
+///   an Astra-owned config file and uses **stable** ids (no `#combo` suffix — `#`
+///   is the hyprland.conf comment char and a changing id orphans the old one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PortalModel {
+    /// Not a portal backend / not yet determined.
+    Unknown = 0,
+    /// KDE-style: the compositor's dialog binds the key.
+    Dialog = 1,
+    /// Hyprland/wlroots-style: the user binds the key in their config.
+    Manual = 2,
+}
+
+impl PortalModel {
+    fn from_u8(v: u8) -> PortalModel {
+        match v {
+            1 => PortalModel::Dialog,
+            2 => PortalModel::Manual,
+            _ => PortalModel::Unknown,
+        }
+    }
+
+    /// Wire string for `hotkey_portal_model()` (JSON / logs).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortalModel::Dialog => "dialog",
+            PortalModel::Manual => "manual",
+            PortalModel::Unknown => "none",
+        }
+    }
+
+    /// `'static` C string for the `hotkey_portal_model()` ABI (caller never frees).
+    pub fn as_cstr(self) -> &'static std::ffi::CStr {
+        match self {
+            PortalModel::Dialog => c"dialog",
+            PortalModel::Manual => c"manual",
+            PortalModel::Unknown => c"none",
+        }
+    }
+}
+
+static PORTAL_MODEL: AtomicU8 = AtomicU8::new(PortalModel::Unknown as u8);
+
+/// Record the portal binding model (called by `hook_wayland` once it knows whether
+/// the compositor binds keys itself or expects the user to).
+pub fn set_portal_model(m: PortalModel) {
+    PORTAL_MODEL.store(m as u8, Ordering::SeqCst);
+}
+
+/// The portal binding model currently in effect.
+pub fn portal_model() -> PortalModel {
+    PortalModel::from_u8(PORTAL_MODEL.load(Ordering::SeqCst))
+}
+
 impl Provider {
     fn from_u8(v: u8) -> Provider {
         match v {
@@ -107,6 +172,12 @@ pub enum BindingStatus {
     /// Registered with the OS but no key is bound yet (portal: user hasn't
     /// accepted; owned: the grab failed, e.g. the combo is held elsewhere).
     NeedsBinding,
+    /// Portal **manual-bind** model (Hyprland/wlroots): the shortcut id IS
+    /// registered with the compositor, but binding a *key* to it is the user's
+    /// job — they (or Astra, via the consent flow) must add a `global` bind to
+    /// their compositor config. Distinct from `NeedsBinding` so the UI can show
+    /// the exact config line (`bind_hint`) instead of a bare "not bound".
+    NeedsCompositorBind,
     /// This backend can't bind global shortcuts at all.
     Unsupported,
 }
@@ -115,11 +186,18 @@ pub enum BindingStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct ShortcutBinding {
     pub id: String,
-    /// Human-readable trigger the compositor reports (portal) or the normalized
-    /// combo we grabbed (owned). `None` when nothing is bound.
+    /// Human-readable trigger the compositor reports (portal-dialog) or the
+    /// normalized combo we grabbed (owned) — or, on the portal **manual-bind**
+    /// model, the user's *desired* combo (we mirror it because the compositor
+    /// returns nothing). `None` when nothing is bound.
     pub combo: Option<String>,
     pub status: BindingStatus,
     pub description: String,
+    /// Portal manual-bind only: the exact line to add to the compositor config to
+    /// bind a key to this shortcut id (e.g. `hl.bind("CTRL+ALT+P", …)` on Lua, or
+    /// `bind = CTRL ALT, P, global, …` on legacy hyprland.conf). `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_hint: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

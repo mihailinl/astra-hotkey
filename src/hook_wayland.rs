@@ -53,7 +53,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::backend::{self, BindingStatus, Provider, ShortcutBinding, ShortcutSpec};
+use crate::backend::{self, BindingStatus, PortalModel, Provider, ShortcutBinding, ShortcutSpec};
 
 /// Commands the C ABI thread sends to the portal actor.
 enum Command {
@@ -412,6 +412,15 @@ async fn bind_set(
 /// bindings cache, then notify the daemon. A desired spec missing from `bound`
 /// is reported as `NeedsBinding` (compositor declined / user hasn't accepted).
 fn apply_shortcuts(desired: &[ShortcutSpec], bound: &[Shortcut]) {
+    // Manual-bind compositor (Hyprland/wlroots): the compositor returns empty
+    // triggers and never binds a key. Delegate to the Hyprland integration, which
+    // writes the Astra-owned config, mirrors the desired combo, and surfaces the
+    // exact `bind_hint` — ignore the (empty) compositor `bound` list entirely.
+    if backend::portal_model() == PortalModel::Manual {
+        crate::hyprland::sync_manual(desired);
+        return;
+    }
+
     let bindings: Vec<ShortcutBinding> = desired
         .iter()
         .map(|spec| match bound.iter().find(|b| b.id() == spec.id) {
@@ -420,12 +429,14 @@ fn apply_shortcuts(desired: &[ShortcutSpec], bound: &[Shortcut]) {
                 combo: Some(b.trigger_description().to_string()),
                 status: BindingStatus::Bound,
                 description: spec.description.clone(),
+                bind_hint: None,
             },
             None => ShortcutBinding {
                 id: spec.id.clone(),
                 combo: None,
                 status: BindingStatus::NeedsBinding,
                 description: spec.description.clone(),
+                bind_hint: None,
             },
         })
         .collect();
@@ -444,7 +455,9 @@ fn apply_shortcuts(desired: &[ShortcutSpec], bound: &[Shortcut]) {
                 "portal: {} NOT bound (compositor declined / awaiting user accept)",
                 b.id
             )),
-            BindingStatus::Unsupported => {}
+            // The dialog path never produces NeedsCompositorBind (that's the
+            // manual-bind/Hyprland branch, handled in `hyprland::sync_manual`).
+            BindingStatus::NeedsCompositorBind | BindingStatus::Unsupported => {}
         }
     }
 
