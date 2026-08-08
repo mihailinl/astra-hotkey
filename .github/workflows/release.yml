@@ -1,0 +1,566 @@
+name: Release build
+
+# Build the astra_hotkey cdylib (+ the Linux-only GTK consent helper) for Linux x64 and
+# Windows x64, and publish them to a GitHub Release.
+#
+# WHY THE GATES BELOW ARE NOT OPTIONAL: the Astra daemon dlopen()s this library by name and then
+# resolves its symbols ONE AT A TIME — four are required, the other nine are probed with
+# `.ok().map(...)`. So a partial or stale artifact does not fail; it silently loses a feature.
+# That is not hypothetical: the astra_hotkey.dll committed into the Astra repo exports 6 of the
+# 15 symbols this source defines, which means every native diagnostic on Windows has been
+# falling into an `eprintln!` on a daemon that owns no console. And a Linux .so missing
+# `hotkey_portal_model` makes the daemon treat Hyprland as the KDE dialog model, emit
+# `#<combo>`-suffixed portal ids, and write a hyprland.conf line where `#` starts a comment —
+# hotkeys then never fire, with nothing anywhere saying so. Every artifact this workflow ships is
+# built from source in the same run, and the export set is asserted before it is uploaded.
+#
+# TRIGGERS
+#   - push to master with a BUMPED Cargo.toml version → AUTO-creates the versioned prerelease
+#     `v<version>` (the normal path: bump the version, push master, it ships itself).
+#   - push to master without a new version → refreshes the rolling `latest` prerelease (a dev build).
+#   - push a `vX.Y.Z` tag directly → that versioned prerelease (manual override).
+#   - workflow_dispatch → same rules, from the Actions tab.
+#
+# SHAPE: resolve → build (matrix) → publish. There is deliberately NO
+# upload-artifact/download-artifact hop: each build job pushes its own asset straight into the
+# release. See the `resolve` job header for the 19-days-of-red-CI reason.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+# The publish job creates/edits a GitHub Release, which needs write access to repo contents.
+permissions:
+  contents: write
+
+# Two pushes to master land minutes apart and both target the rolling `latest`. Without this they
+# interleave their `gh release upload --clobber` calls and `latest` ends up carrying a Linux
+# tarball from one commit beside a Windows DLL from another. `cancel-in-progress: false` because
+# cancelling mid-upload is how you get that skew, not how you avoid it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+  # The glibc floor the Linux artifacts are BUILT to hit, asserted after every build.
+  # GLIBC_2.34 = Ubuntu 22.04+, Debian 12+, RHEL 9+.
+  #
+  # This is not cosmetic and it is not free: the .so currently committed into the Astra repo has a
+  # NON-WEAK GLIBC_2.39 verneed, which comes entirely from `pidfd_spawnp`/`pidfd_getpid`. Rust's
+  # std references those for `std::process::Command`, which hyprland.rs uses to run `hyprctl
+  # reload` and to spawn the consent helper. On a build host whose glibc predates 2.39 the symbol
+  # does not exist, std emits an unversioned weak reference, and the floor drops to 2.34 for free.
+  # It is therefore purely an artifact of WHERE the binary was linked — and on any distro below
+  # that floor the daemon's `Library::new` fails, which it downgrades to
+  # `warn!("Hotkey service initialization failed")` and no global hotkey ever works again.
+  MAX_GLIBC: GLIBC_2.34
+
+  # The Linux build runs INSIDE this image, not on the runner. The floor is a property of the
+  # machine that linked the binary, so it has to be pinned somewhere explicit — pinning the runner
+  # image instead silently raises it the day GitHub re-bases or retires that image, and the
+  # retirement notice says nothing about glibc. Running the compiler in a container rather than
+  # setting `container:` on the job keeps `gh` and `git` on the host, where they are preinstalled.
+  LINUX_BUILD_IMAGE: ubuntu:22.04
+
+  # Asset names. The astra-rs consumer (astra-rs/components.json + astra-rs/scripts/fetch-components.{sh,ps1})
+  # matches on these strings, so they are API — renaming one breaks the fetcher with a 404 rather
+  # than a compile error.
+  #
+  # Linux is a TARBALL and Windows is a bare DLL, and the asymmetry is deliberate. Linux ships two
+  # files, one of which (`astra-hotkey-consent`) is EXECUTED rather than dlopen()ed; a GitHub
+  # release asset carries no POSIX mode bits, so a bare download would arrive without its +x and
+  # the Hyprland setup dialog would fail to spawn — reported by the daemon as success, because
+  # `run_consent` returns true as soon as the spawn thread starts. tar preserves the mode. Windows
+  # ships exactly one file that needs no mode bits, and zipping it would only add an unpack step
+  # to every consumer for nothing.
+  LINUX_ASSET: astra-hotkey-linux-x86_64.tar.gz
+  WINDOWS_ASSET: astra_hotkey-windows-x86_64.dll
+
+jobs:
+  # ── Decide WHAT we are releasing, and make sure it exists to upload into ─────────────────────
+  #
+  # This job exists because the artifact hop had to go. The shape used to be
+  # build → upload-artifact → download-artifact → release, and the artifacts were pure plumbing:
+  # they carried files between jobs minutes apart while the durable copy was always the Release
+  # asset. But `actions/upload-artifact` charges the ACCOUNT-WIDE storage quota, and when that
+  # quota is full it fails HARD — in the sibling astra-companion repo that killed every run from
+  # 2026-07-06 to 2026-07-25 and again on 2026-07-28, with all compiles green. Nineteen days of
+  # red CI that was never a compile error. Release assets do not touch that quota.
+  #
+  # ALL-OR-NOTHING is preserved by the draft: a new versioned release is created DRAFT here, the
+  # build jobs upload into it, and `publish` makes it visible only after BOTH platforms succeeded.
+  # That matters more here than almost anywhere, because a half-published release is precisely the
+  # "Windows and Linux ship different versions of the same library" failure the Astra bundle
+  # already lived through. The rolling `latest` is the one exception: it already exists and stays
+  # visible, so its assets are replaced a few minutes apart. That is a dev build.
+  resolve:
+    name: Resolve release target
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+      name: ${{ steps.target.outputs.name }}
+      version: ${{ steps.target.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Decide the release target:
+      #   - a `vX.Y.Z` tag push → that versioned release.
+      #   - a master push whose Cargo.toml version has NO release yet (a bump just landed)
+      #     → auto-create it.
+      #   - any other master push → refresh the rolling `latest` dev build.
+      #
+      # A LEFTOVER DRAFT counts as "not released yet". Without that arm, one failed run leaves a
+      # draft `vX.Y.Z` behind, the next run sees the tag "exists" and quietly downgrades the whole
+      # version to `latest` — the bump never ships and nothing says so.
+      - name: Resolve release target
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the version field out of Cargo.toml"
+            exit 1
+          fi
+          # Read the ref from the preset $GITHUB_REF_TYPE/$GITHUB_REF_NAME environment variables
+          # rather than interpolating ${{ github.ref_name }} into the script text. A tag name is
+          # text somebody with push access wrote, and `${{ }}` is substituted BEFORE bash parses
+          # the line — so a tag containing shell metacharacters would be executed, not compared.
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"; name="$tag"
+          else
+            tag="v$version"
+            draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || echo none)
+            if [[ "$draft" == "false" ]]; then
+              echo "Release $tag is already published -> refreshing the rolling 'latest'."
+              tag="latest"; name="Latest dev build (master)"
+            elif [[ "$draft" == "true" ]]; then
+              echo "Release $tag exists but is still a DRAFT (a previous run failed) -> finishing it."
+              name="$tag"
+            else
+              echo "Version bump detected ($tag has no release) -> auto-creating it."
+              name="$tag"
+            fi
+          fi
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "name=$name"       >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Create it if absent, as a DRAFT, so the build jobs have somewhere to upload. Done HERE in
+      # a single job rather than in the two build jobs: concurrent `gh release create` calls on
+      # the same tag race, and one of them loses with a confusing 422.
+      - name: Ensure the release exists (draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+          REL_NAME: ${{ steps.target.outputs.name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$TAG already exists - the build jobs will replace its assets."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$REL_NAME" --draft --prerelease --notes "pending"
+          fi
+
+  # ── Linux x86_64 ─────────────────────────────────────────────────────────────────────────────
+  linux:
+    name: Build (Linux x86_64)
+    needs: resolve
+    # The HOST runner is pinned only so `gh`, `git` and `docker` are a known quantity; the
+    # toolchain that decides the glibc floor lives in $LINUX_BUILD_IMAGE, not here.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cargo.lock is in this repo's .gitignore and is NOT tracked, so CI re-resolves ashpd, zbus,
+      # global-hotkey, gtk4 and tokio from scratch on every run. That means two builds of the same
+      # commit are not the same binary, and a patch release upstream can turn a green pipeline red
+      # — or, worse, silently change portal behaviour inside a shipped .so — with no change in this
+      # repo. We cannot fix that from a workflow, so we do the two things a workflow can: build
+      # `--locked` the moment the lockfile IS tracked (so the fix takes effect without touching
+      # this file again), and publish the resolved lockfile as a release asset so the resolution
+      # behind any given artifact is at least recoverable after the fact.
+      - name: Decide whether the build can be locked
+        id: lock
+        run: |
+          set -euo pipefail
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            echo "flag=--locked" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Cargo.lock is not tracked::Dependencies are re-resolved on every run, so this artifact is not reproducible. Remove Cargo.lock from .gitignore and commit it; this workflow switches to --locked automatically once it is tracked."
+          fi
+
+      # Everything compiles inside the pinned floor image. Notes on the deps list, because it is
+      # shorter than people expect and padding it hides what actually matters:
+      #   - libgtk-4-dev is needed ONLY for the `astra-hotkey-consent` binary. It transitively
+      #     brings glib/gdk-pixbuf/cairo/pango/graphene, which is everything the -sys crates probe.
+      #   - libx11-dev and libdbus-1-dev are NOT needed and must not be added (the README's
+      #     "Linux: libx11-dev" line is stale). ashpd/zbus speak D-Bus in pure Rust over a Unix
+      #     socket, and global-hotkey reaches X11 through x11-dl, which dlopens. Adding them would
+      #     imply a build-time dependency that does not exist and invite someone to "simplify" the
+      #     real one away.
+      #   - rustup is installed INSIDE the container. The host's toolchain binaries are linked
+      #     against the runner's newer glibc and simply will not execute here.
+      #
+      # There is no `Swatinem/rust-cache` on this leg: the cache action manages the host's
+      # ~/.cargo, and the container has its own $HOME. Not worth rebuilding around — a cold build
+      # of 28 crates with LTO is about a minute, and a cache that silently outlives a toolchain
+      # change costs far more than that to debug.
+      - name: Build + test in ${{ env.LINUX_BUILD_IMAGE }}
+        env:
+          LOCKED: ${{ steps.lock.outputs.flag }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/hotkey-build.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-4-dev curl ca-certificates
+
+          export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+          export PATH="/opt/cargo/bin:$PATH"
+
+          echo "--- toolchain ---"
+          rustc --version
+          ldd --version | head -n1
+          pkg-config --modversion gtk4
+
+          cd /src
+          # `--features consent-gtk` builds BOTH artifacts from this one invocation: the cdylib and
+          # the consent binary (whose [[bin]] carries `required-features = ["consent-gtk"]`, so a
+          # bare `cargo build` produces the .so alone). The feature does NOT leak GTK into the
+          # cdylib — that separation is asserted in the verify step, not trusted.
+          #
+          # RUSTFLAGS=-D warnings is deliberately NOT set anywhere in this workflow. The Windows
+          # target compiles with 24 dead-code warnings (the whole id-ABI backend is Linux-only in
+          # practice) and denying them would red that leg on day one for code that is correct.
+          cargo build --release --features consent-gtk ${LOCKED:-}
+          # 13 tests here (8 are the Linux-only hyprland module). Cheap, and they cover the
+          # config-injection hardening in hyprland.rs — code that writes into the user's own
+          # compositor config, so it is the one part of this crate where a regression is a
+          # security bug rather than a broken feature.
+          cargo test --release --features consent-gtk ${LOCKED:-}
+
+          # Files created in a container are root-owned. On the hosted runners each job gets a
+          # fresh VM so nothing notices, but on a self-hosted runner the next job's
+          # `actions/checkout` clean step runs as the runner user and cannot delete them.
+          # `if`, not `[ ... ] && ...`: under `set -e` a trailing && list that evaluates false is
+          # the script's exit status, so a missing lockfile would fail the job for no reason.
+          chown -R "${HOST_UID}:${HOST_GID}" /src/target
+          if [ -f /src/Cargo.lock ]; then chown "${HOST_UID}:${HOST_GID}" /src/Cargo.lock; fi
+          SCRIPT
+          chmod +x /tmp/hotkey-build.sh
+          docker run --rm \
+            -v "$PWD:/src" \
+            -v /tmp/hotkey-build.sh:/build.sh:ro \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e LOCKED \
+            -w /src "$LINUX_BUILD_IMAGE" /build.sh
+
+      # Every check runs INSIDE the same floor image, because a gate that runs on the host's newer
+      # glibc cannot tell you whether the artifact loads on the floor.
+      - name: Verify the Linux artifacts
+        run: |
+          set -euo pipefail
+          cat > /tmp/hotkey-verify.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends binutils gcc libc6-dev >/dev/null
+
+          SO=/src/target/release/libastra_hotkey.so
+          CONSENT=/src/target/release/astra-hotkey-consent
+          test -f "$SO"      || { echo "::error::$SO was not produced"; exit 1; }
+          test -f "$CONSENT" || { echo "::error::$CONSENT was not produced - did the consent-gtk feature get dropped?"; exit 1; }
+          test -x "$CONSENT" || { echo "::error::$CONSENT is not executable"; exit 1; }
+
+          # --- versioned-symbol floor -------------------------------------------------------
+          # Checked on BOTH files. `sort -V` orders GLIBC_2.4 before GLIBC_2.34 correctly.
+          check_floor() {
+            local f="$1" max
+            max=$(objdump -T "$f" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -uV | tail -n1 || true)
+            echo "$(basename "$f"): highest GLIBC reference ${max:-none} (limit ${MAX_GLIBC})"
+            [ -n "$max" ] || return 0
+            if [ "$(printf '%s\n%s\n' "$max" "$MAX_GLIBC" | sort -V | tail -n1)" != "$MAX_GLIBC" ]; then
+              echo "::error::$(basename "$f") requires $max but the declared floor is $MAX_GLIBC."
+              echo "::error::Almost always this means the build host's glibc has pidfd_spawnp (>= 2.39)."
+              echo "::error::The daemon reports the resulting load failure as a warning, so on the user's"
+              echo "::error::machine it presents as 'global hotkeys just stopped working'."
+              exit 1
+            fi
+          }
+          check_floor "$SO"
+          check_floor "$CONSENT"
+
+          # --- the cdylib must NOT link GTK -------------------------------------------------
+          # The whole point of putting the consent dialog in a separate binary is that the library
+          # the daemon dlopens stays free of GTK. Nothing enforces that in the source: one `use
+          # gtk4::` in lib.rs behind the feature would make every user's machine need libgtk-4 to
+          # load a hotkey library, and it would be invisible in review.
+          if readelf -d "$SO" | grep -qi gtk; then
+            echo "::error::$SO links GTK. The dlopened cdylib must stay GTK-free; GTK belongs only in astra-hotkey-consent."
+            readelf -d "$SO"
+            exit 1
+          fi
+          echo "cdylib links: $(readelf -d "$SO" | grep NEEDED | awk '{print $NF}' | tr -d '[]' | tr '\n' ' ')"
+
+          # ...and the consent helper MUST link it, or the feature silently did nothing.
+          readelf -d "$CONSENT" | grep -q 'libgtk-4' \
+            || { echo "::error::$CONSENT does not link libgtk-4 - it cannot be the GTK dialog"; exit 1; }
+
+          # --- exported symbol set, derived from the source ---------------------------------
+          # Derived, never hardcoded, so it tracks lib.rs instead of rotting beside it. None of the
+          # `#[no_mangle]` functions is cfg-gated today, which is why the SAME expected set is
+          # asserted on both platforms. If you ever add a `#[cfg]` to one of them this canary will
+          # fire on the other platform — that is the point: the daemon dlopens by name on both and
+          # probes most symbols optionally, so a platform-missing export disables a feature in
+          # silence. Make that a deliberate decision, not a discovery six months later.
+          expected=$(grep -oE '^pub extern "C" fn [a-z0-9_]+' /src/src/lib.rs | awk '{print $5}' | sort -u)
+          count=$(printf '%s\n' "$expected" | grep -c . || true)
+          # A canary that can pass vacuously is not a canary.
+          [ "$count" -ge 10 ] || { echo "::error::only $count exports parsed out of src/lib.rs - the extraction regex is broken"; exit 1; }
+          echo "checking $count exports declared in src/lib.rs"
+          missing=0
+          for sym in $expected; do
+            nm -D --defined-only "$SO" | awk '{print $NF}' | grep -qx "$sym" || { echo "::error::missing export: $sym"; missing=1; }
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          # --- load it for real, the way the daemon does ------------------------------------
+          # libloading uses RTLD_NOW, so this reproduces `HotkeyLib::load` exactly: an
+          # unsatisfiable version reference or a missing NEEDED fails here instead of as a warn!
+          # on a user's machine. Only dlopen+dlsym — never hotkey_init, which would install hooks.
+          cat > /tmp/probe.c <<'PROBE'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int argc, char **argv) {
+              void *h = dlopen(argv[1], RTLD_NOW);
+              if (!h) { fprintf(stderr, "dlopen failed: %s\n", dlerror()); return 1; }
+              for (int i = 2; i < argc; i++) {
+                  dlerror();
+                  if (!dlsym(h, argv[i]) && dlerror()) {
+                      fprintf(stderr, "dlsym failed: %s\n", argv[i]);
+                      return 1;
+                  }
+              }
+              return 0;
+          }
+          PROBE
+          gcc -O0 -o /tmp/probe /tmp/probe.c -ldl
+          # shellcheck disable=SC2086
+          /tmp/probe "$SO" $expected || { echo "::error::the built library does not dlopen+resolve on ${MAX_GLIBC}-era userspace"; exit 1; }
+          echo "dlopen(RTLD_NOW) + resolve of all $count symbols: OK"
+          SCRIPT
+          chmod +x /tmp/hotkey-verify.sh
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v /tmp/hotkey-verify.sh:/verify.sh:ro \
+            -e MAX_GLIBC \
+            "$LINUX_BUILD_IMAGE" /verify.sh
+
+      # Straight into the release - no artifact hop, so the account-wide artifact storage quota
+      # cannot block a ship (see the `resolve` header). `--clobber` makes a re-run idempotent.
+      #
+      # The tarball is FLAT (both files at the root) so the consumer's extract rules are just
+      # filenames, and `--mode` is left alone so cargo's 0755 on both outputs is what lands.
+      #
+      # The `.sha256` sidecar is published so the astra-rs manifest generator can record a hash the
+      # BUILDER computed rather than one it computed itself from a possibly truncated download — a
+      # silently short read that both sides hash identically is the one integrity failure a
+      # self-computed checksum cannot see.
+      - name: Package + upload the Linux asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/libastra_hotkey.so target/release/astra-hotkey-consent dist/
+          chmod 0755 dist/libastra_hotkey.so dist/astra-hotkey-consent
+          tar -C dist -czf "$LINUX_ASSET" libastra_hotkey.so astra-hotkey-consent
+          sha256sum "$LINUX_ASSET" > "$LINUX_ASSET.sha256"
+
+          # The lockfile that produced these binaries. Not the same thing as a tracked lockfile —
+          # it does not make the build reproducible, it only makes the resolution auditable after
+          # the fact. Uploaded from this leg alone because a Cargo lockfile is target-independent.
+          cp Cargo.lock astra-hotkey-Cargo.lock
+
+          gh release upload "$TAG" \
+            "$LINUX_ASSET" "$LINUX_ASSET.sha256" astra-hotkey-Cargo.lock \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # ── Windows x86_64 ───────────────────────────────────────────────────────────────────────────
+  windows:
+    name: Build (Windows x86_64)
+    needs: resolve
+    # Pinned to windows-2022 rather than windows-latest, which now carries VS 18 2026. This crate
+    # needs nothing but MSVC (the `windows` crate ships its own import libraries — no Windows SDK,
+    # CMake, Ninja or LLVM anywhere in the Windows dependency graph), so the pin is cheap; and the
+    # linker that produces a DLL other people dlopen is a toolchain choice that should arrive in a
+    # commit, not on the day GitHub re-bases an image.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Not needed to COMPILE — rustc finds link.exe through its own vcvars discovery, and this
+      # crate pulls in no C or C++ at all (the `windows` crate ships its own import libraries).
+      # It is here purely so `dumpbin` is on PATH for the export canary below. Without it that
+      # step dies with "dumpbin: command not found", i.e. the one gate that matters most is also
+      # the one most likely to be deleted as "broken tooling".
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      # Present on this leg only: the cache action manages the runner's ~/.cargo, which the Linux
+      # leg's container cannot see (it has its own $HOME). Not a discrepancy worth removing — the
+      # Linux build is about a minute cold.
+      - uses: Swatinem/rust-cache@v2
+
+      # Same conditional as the Linux leg — see the long note there. No `::warning::` on this one:
+      # it would be the same warning twice on every run, and a warning people learn to scroll past
+      # is worse than no warning.
+      - name: Decide whether the build can be locked
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            echo "flag=--locked" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # NO `--features consent-gtk` here, and this is not an omission that can be tidied away: the
+      # feature satisfies the consent binary's `required-features`, so cargo would compile
+      # src/bin/consent.rs — but `gtk4` is declared only under
+      # [target.'cfg(target_os = "linux")'.dependencies], so it is not in the Windows dependency
+      # graph at all. The result is a hard compile failure, six errors deep in a bin nobody wanted:
+      #   error[E0433]: cannot find module or crate `gtk4`
+      # Which is why the flag lives in each leg's build command and NOT in a shared `env:` — a
+      # well-meant "unify the two build steps" refactor breaks this leg instantly. Reproduce
+      # without a Windows machine: cargo check --target x86_64-pc-windows-msvc --features consent-gtk
+      #
+      # `shell: bash` so ONE script serves both runners (the Windows default is pwsh).
+      - name: Build + test
+        shell: bash
+        env:
+          LOCKED: ${{ steps.lock.outputs.flag }}
+        run: |
+          set -euo pipefail
+          cargo build --release ${LOCKED:-}
+          # 5 tests on this target (the 8 hyprland ones are Linux-only).
+          cargo test --release ${LOCKED:-}
+
+      # THE gate this whole workflow exists for. The astra_hotkey.dll committed into the Astra repo
+      # exports 6 of the 15 symbols this source defines — it was built in April, `hotkey_set_log_callback`
+      # landed in June, and nothing anywhere noticed because the daemon probes that symbol with
+      # `.ok()` and simply logs nothing when it is absent.
+      #
+      # dumpbin options are written with a LEADING DASH, not a slash: under Git Bash, MSYS path
+      # conversion rewrites `/exports` into a Windows path and dumpbin then reports a nonsense
+      # error about a file it was never asked to open. `-exports` is accepted by every MSVC tool.
+      - name: Verify the Windows artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          DLL=target/release/astra_hotkey.dll
+          test -f "$DLL" || { echo "::error::$DLL was not produced"; exit 1; }
+
+          expected=$(grep -oE '^pub extern "C" fn [a-z0-9_]+' src/lib.rs | awk '{print $5}' | sort -u)
+          count=$(printf '%s\n' "$expected" | grep -c . || true)
+          [ "$count" -ge 10 ] || { echo "::error::only $count exports parsed out of src/lib.rs - the extraction regex is broken"; exit 1; }
+          echo "checking $count exports declared in src/lib.rs"
+
+          # `dumpbin` is on PATH because of the msvc-dev-cmd step above — that is its only job here.
+          # If a future image ever drops dumpbin, `llvm-nm --defined-only` over target/release/
+          # astra_hotkey.dll.lib is the fallback (the rustup `llvm-tools` component ships it).
+          dumpbin -exports "$DLL" > exports.txt
+          missing=0
+          for sym in $expected; do
+            grep -qw "$sym" exports.txt || { echo "::error::missing export: $sym"; missing=1; }
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::The Windows DLL does not export everything src/lib.rs defines."
+            echo "::error::The daemon resolves most of these optionally, so shipping this would disable"
+            echo "::error::features silently rather than failing - which is how the committed DLL came to"
+            echo "::error::be two months stale without anyone noticing."
+            exit 1
+          fi
+          echo "all $count exports present"
+
+      - name: Upload the Windows asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cp target/release/astra_hotkey.dll "$WINDOWS_ASSET"
+          sha256sum "$WINDOWS_ASSET" > "$WINDOWS_ASSET.sha256"
+          gh release upload "$TAG" "$WINDOWS_ASSET" "$WINDOWS_ASSET.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish:
+    name: Publish release
+    needs: [resolve, linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      # Both platforms are green and all assets are uploaded — make the release visible and give
+      # it its real notes. For a new version this is the moment the draft becomes a release; for
+      # the rolling `latest` (already visible) it only refreshes the body, which is where the
+      # commit SHA lives.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          REL_NAME: ${{ needs.resolve.outputs.name }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<EOF
+          Automated build of **astra_hotkey** v$VERSION ($TAG @ \`$GITHUB_SHA\`).
+
+          | Asset | Contains | Install as |
+          |-------|----------|------------|
+          | \`$LINUX_ASSET\` | \`libastra_hotkey.so\`, \`astra-hotkey-consent\` | \`runtimes/linux-x64/\` (both, mode 0755) |
+          | \`$WINDOWS_ASSET\` | — | \`runtimes/win-x64/astra_hotkey.dll\` |
+          | \`astra-hotkey-Cargo.lock\` | the resolved dependency graph | — (provenance only) |
+
+          Each binary asset has a \`.sha256\` sidecar.
+
+          **Linux floor:** built and load-tested on \`$MAX_GLIBC\` userspace — Ubuntu 22.04+,
+          Debian 12+, RHEL 9+. The \`.so\` links only libc/libm/libgcc_s (X11 and D-Bus are reached
+          without linking them), and CI asserts it does **not** link GTK.
+          \`astra-hotkey-consent\` **does** need \`libgtk-4.so.1\` at runtime — that is a bundle
+          prerequisite, and without it the Hyprland setup dialog fails to appear while the daemon
+          still reports success.
+
+          CI asserts that both platforms export every \`#[no_mangle]\` function in \`src/lib.rs\`.
+          EOF
+          )
+          # Both the versioned tags and `latest` are PRERELEASES: these are component artifacts
+          # consumed by the Astra build, not something a person should find under a repo's
+          # "Latest release" banner.
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "$REL_NAME" --notes "$notes" --draft=false --prerelease
+
+          # Move the rolling `latest` TAG to this commit. `gh release create --target` only places
+          # a tag that does not exist yet, so on every run after the first the assets and the body
+          # would advance while the tag silently kept pointing at an old commit — and
+          # `git checkout latest` would hand you source that does not match the binary beside it.
+          # Versioned tags are immutable and never touched.
+          if [[ "$TAG" == "latest" ]]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/latest" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          fi
