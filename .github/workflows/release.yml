@@ -238,7 +238,7 @@ jobs:
 
           echo "--- toolchain ---"
           rustc --version
-          ldd --version | head -n1
+          ldd --version 2>&1 | sed -n 1p
           pkg-config --modversion gtk4
 
           cd /src
@@ -421,13 +421,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Not needed to COMPILE — rustc finds link.exe through its own vcvars discovery, and this
-      # crate pulls in no C or C++ at all (the `windows` crate ships its own import libraries).
-      # It is here purely so `dumpbin` is on PATH for the export canary below. Without it that
-      # step dies with "dumpbin: command not found", i.e. the one gate that matters most is also
-      # the one most likely to be deleted as "broken tooling".
-      - uses: ilammy/msvc-dev-cmd@v1
-
       # Present on this leg only: the cache action manages the runner's ~/.cargo, which the Linux
       # leg's container cannot see (it has its own $HOME). Not a discrepancy worth removing — the
       # Linux build is about a minute cold.
@@ -476,6 +469,24 @@ jobs:
       # dumpbin options are written with a LEADING DASH, not a slash: under Git Bash, MSYS path
       # conversion rewrites `/exports` into a Windows path and dumpbin then reports a nonsense
       # error about a file it was never asked to open. `-exports` is accepted by every MSVC tool.
+      # AFTER the build, never before it, and the reason is not style.
+      #
+      # This action puts the MSVC tools on PATH, which is what `dumpbin` needs for
+      # the export canary below. But every build step here runs under `shell: bash`
+      # (Git for Windows), whose PATH begins with /usr/bin — and Git ships its own
+      # `link.exe`, the GNU coreutils hard-link utility. Once MSVC's `link.exe` is
+      # reachable by bare name, rustc stops using its own absolute vcvars-discovered
+      # path and lets PATH decide, so coreutils wins:
+      #
+      #   note: /usr/bin/link: extra operand '...build_script_build...rcgu.o'
+      #   error: linking with `link.exe` failed: exit code: 1
+      #
+      # Every build script in the dependency graph failed that way — proc-macro2,
+      # quote, windows_x86_64_msvc — on a crate that pulls in no C or C++ at all.
+      # Compiling needs nothing from this action (astra-indexing's Windows leg has
+      # no such step and builds fine); only dumpbin does. So it runs here.
+      - uses: ilammy/msvc-dev-cmd@v1
+
       - name: Verify the Windows artifact
         shell: bash
         run: |
