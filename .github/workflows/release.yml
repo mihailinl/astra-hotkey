@@ -127,9 +127,15 @@ jobs:
             exit 1
           fi
           # Read the ref from the preset $GITHUB_REF_TYPE/$GITHUB_REF_NAME environment variables
-          # rather than interpolating ${{ github.ref_name }} into the script text. A tag name is
-          # text somebody with push access wrote, and `${{ }}` is substituted BEFORE bash parses
-          # the line — so a tag containing shell metacharacters would be executed, not compared.
+          # rather than interpolating a github-context expression into the script text. A tag name
+          # is text somebody with push access wrote, and Actions substitutes expressions BEFORE
+          # bash parses the line — so a tag containing shell metacharacters would be executed,
+          # not compared.
+          #
+          # This comment deliberately spells none of that syntax out. Actions substitutes inside
+          # shell COMMENTS too, and an empty expression is not valid, so writing the braces here
+          # made the whole workflow file fail to load: every run ended in 0s with "This run likely
+          # failed because of a workflow file issue", no jobs, and nothing naming the line.
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             tag="$GITHUB_REF_NAME"; name="$tag"
           else
