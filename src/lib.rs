@@ -14,6 +14,9 @@ mod registry;
 #[cfg(windows)]
 mod hook_windows;
 
+#[cfg(target_os = "macos")]
+mod hook_macos;
+
 #[cfg(target_os = "linux")]
 mod hook_linux;
 #[cfg(target_os = "linux")]
@@ -64,7 +67,21 @@ pub extern "C" fn hotkey_init(callback: extern "C" fn(*const c_char)) -> bool {
         hook_linux::start_hook()
     }
 
-    #[cfg(not(any(windows, target_os = "linux")))]
+    // Carbon `RegisterEventHotKey` on a dedicated run-loop thread — no TCC
+    // permission needed; see `hook_macos.rs`.
+    #[cfg(target_os = "macos")]
+    {
+        let ok = hook_macos::start_hook();
+        if !ok {
+            // Leave the lib re-initialisable after a failed start.
+            if let Some(cb_cell) = CALLBACK.get() {
+                *cb_cell.lock() = None;
+            }
+        }
+        ok
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         false
     }
@@ -135,6 +152,9 @@ pub extern "C" fn hotkey_shutdown() {
     #[cfg(windows)]
     hook_windows::stop_hook();
 
+    #[cfg(target_os = "macos")]
+    hook_macos::stop_hook();
+
     // Idempotent across legacy X11, id-based X11, and the portal actor — each
     // stop is a safe no-op if that backend was never started.
     #[cfg(target_os = "linux")]
@@ -198,7 +218,7 @@ fn legacy_invoke_callback(keys: &str) {
 // exist so the daemon can resolve the same set everywhere.
 // ===========================================================================
 
-/// Which native backend the library selected: `"windows" | "x11" | "portal" | "none"`.
+/// Which native backend the library selected: `"windows" | "x11" | "portal" | "macos" | "none"`.
 /// Returns a `'static` C string — do **not** pass it to `hotkey_free`.
 #[no_mangle]
 pub extern "C" fn hotkey_backend() -> *const c_char {
@@ -210,7 +230,11 @@ pub extern "C" fn hotkey_backend() -> *const c_char {
     {
         backend::provider().as_cstr().as_ptr()
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        c"macos".as_ptr()
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         c"none".as_ptr()
     }

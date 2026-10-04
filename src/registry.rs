@@ -160,6 +160,19 @@ pub fn register_hotkey(keys: &str) -> bool {
     #[cfg(target_os = "linux")]
     let _ = crate::hook_linux::register(&normalized);
 
+    // macOS: the Carbon grab is authoritative — a combo it cannot grab (no
+    // macOS keycode, a mouse button, modifier-only) or that the OS refuses is
+    // NOT recorded, so the caller sees `false` as for an invalid combo.
+    #[cfg(target_os = "macos")]
+    {
+        if REGISTERED_HOTKEYS.read().contains(&normalized) {
+            return false;
+        }
+        if !crate::hook_macos::register(&normalized) {
+            return false;
+        }
+    }
+
     let mut hotkeys = REGISTERED_HOTKEYS.write();
     hotkeys.insert(normalized)
 }
@@ -170,6 +183,8 @@ pub fn unregister_hotkey(keys: &str) -> bool {
     let normalized = normalize_hotkey(keys);
     #[cfg(target_os = "linux")]
     let _ = crate::hook_linux::unregister(&normalized);
+    #[cfg(target_os = "macos")]
+    let _ = crate::hook_macos::unregister(&normalized);
     let mut hotkeys = REGISTERED_HOTKEYS.write();
     hotkeys.remove(&normalized)
 }
@@ -178,8 +193,17 @@ pub fn unregister_hotkey(keys: &str) -> bool {
 pub fn unregister_all() {
     #[cfg(target_os = "linux")]
     crate::hook_linux::unregister_all();
+    #[cfg(target_os = "macos")]
+    crate::hook_macos::unregister_all();
     let mut hotkeys = REGISTERED_HOTKEYS.write();
     hotkeys.clear();
+}
+
+/// Every registered (normalized) combo — the macOS backend re-grabs these when
+/// its Carbon thread starts, so registrations made before `hotkey_init` count.
+#[cfg(target_os = "macos")]
+pub fn snapshot() -> Vec<String> {
+    REGISTERED_HOTKEYS.read().iter().cloned().collect()
 }
 
 /// Check if a key combination is registered.
@@ -201,7 +225,7 @@ pub fn count() -> usize {
 /// Takes current modifiers and a regular key. Used by the Windows low-level
 /// hook; on Linux the X11/portal backends match by their own registered set, so
 /// this is unused there.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
 pub fn check_hotkey(modifiers: Modifiers, key: &str) -> Option<String> {
     // Build the hotkey string from current state
     let mut parts = Vec::new();
@@ -264,6 +288,10 @@ mod tests {
         assert_eq!(normalize_hotkey("MOUSE2"), "MOUSE2");
     }
 
+    // Mouse buttons are matched by the Windows low-level hook through
+    // `check_hotkey`. macOS's Carbon backend cannot grab mouse buttons, so there
+    // `register_hotkey("Ctrl+MOUSE2")` correctly returns false.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_register_and_match_mouse_hotkey() {
         let _serial = SERIAL.lock();
